@@ -1,0 +1,265 @@
+
+```{r} 
+#install all relevant packages
+install.packages('readxl')
+install.packages('lubridate')
+install.packages('stringr')
+install.packages('ggplot2')
+install.packages('tidyverse')
+library(readxl)
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(tidyverse)
+```
+
+```{r}
+#combine all presented csv files into one data set
+cherry <- read.csv("washingtondc.csv") %>% 
+  bind_rows(read.csv("liestal.csv")) %>% 
+  bind_rows(read.csv("kyoto.csv")) %>% 
+  bind_rows(read.csv("vancouver.csv"))
+```
+
+```{r}
+#create neccessary functions for data collection
+install.packages("rnoaa")
+library(rnoaa)
+
+stations <- ghcnd_stations()
+
+#get max temperatures
+get_temperature <- function (stationid) {
+  ghcnd_search(stationid = stationid, var = c("tmax"), 
+               date_min = "1950-01-01", date_max = "2024-05-31")[[1]] %>%
+    mutate(year = as.integer(format(date, "%Y")),
+           month = as.integer(strftime(date, '%m')) %% 12, # make December "0"
+           season = cut(month, breaks = c(0, 2, 5, 8, 11),
+                        include.lowest = TRUE,
+                        labels = c("Winter", "Spring", "Summer", "Fall")),
+           year = if_else(month == 0, year + 1L, year)) %>%
+    group_by(year, season) %>%
+    summarize(tmax_avg = mean(tmax, na.rm = TRUE))
+}
+#get min temperatures
+get_mintemp <- function (stationid){
+  ghcnd_search(stationid = stationid, var = c("tmin"), 
+               date_min = "1950-01-01", date_max = "2024-05-31")[[1]] %>%
+    mutate(year1 = as.integer(format(date, "%Y")),
+           month1 = as.integer(strftime(date, '%m')) %% 12, # make December "0"
+           season1 = cut(month1, breaks = c(0, 2, 5, 8, 11),
+                         include.lowest = TRUE,
+                         labels = c("Winter", "Spring", "Summer", "Fall")),
+           year1 = if_else(month1 == 0, year1 + 1L, year1)) %>%
+    group_by(year1, season1) %>%
+    summarize(tmin_avg = mean(tmin, na.rm = TRUE))
+}
+#get average seasonal precipitation
+get_prcp <- function (stationid){
+  ghcnd_search(stationid = stationid, var = c("prcp"), 
+               date_min = "1950-01-01", date_max = "2024-05-31")[[1]] %>%
+    mutate(year2 = as.integer(format(date, "%Y")),
+           month2 = as.integer(strftime(date, '%m')) %% 12, # make December "0"
+           season2 = cut(month2, breaks = c(0, 2, 5, 8, 11),
+                         include.lowest = TRUE,
+                         labels = c("Winter", "Spring", "Summer", "Fall")),
+           year2 = if_else(month2 == 0, year2 + 1L, year2)) %>%
+    group_by(year2, season2) %>%
+    summarize(prcp_avg = mean(prcp, na.rm = TRUE))
+  }
+
+```
+
+```{r}
+#getting historic temperature data
+historic_temperatures <-
+  tibble(location = "washingtondc", get_temperature("USC00186350"), get_mintemp("USC00186350"), get_prcp("USC00186350")) %>%
+  bind_rows(tibble(location = "liestal", get_temperature("GME00127786"), get_mintemp("GME00127786"), get_prcp("GME00127786"))) %>%
+  bind_rows(tibble(location = "kyoto", get_temperature("JA000047759"), get_mintemp("JA000047759"), get_prcp("JA000047759"))) %>%
+  bind_rows(tibble(location = "vancouver", get_temperature("CA001108395"), get_mintemp("CA001108395"), get_prcp("CA001108395")))
+
+
+historic_temperatures$tmax_avg <- historic_temperatures$tmax_avg/10
+historic_temperatures$tmin_avg <- historic_temperatures$tmin_avg/10
+```
+
+```{r}
+#getting all necessary data into proper data sets 
+historic_temperatures <- historic_temperatures%>%
+  select(-c(year1, season1, year2, season2))
+
+cherry <- cherry %>%
+  filter(year >=1950)
+#test will be used for linear mixed effect model and linear regression model
+test <-  merge(cherry, historic_temperatures, by = c("location", "year"), all = TRUE)
+test <- na.omit(test)
+test <- test %>%
+  select(- bloom_date) %>%
+  filter(season == "Spring")
+#training data set for test
+test_1 <- test%>%filter(year<2019)
+#test data set for test
+test_2 <- test%>%filter(year>=2019 & location != "vancouver")
+
+temp <- ghcnd_search(stationid = c("USC00186350", "GME00127786", "JA000047759", "CA001108395"), var = c("tmax"), 
+             date_min = "1950-01-01", date_max = "2024-03-31")[[1]] %>%
+  left_join(ghcnd_search(stationid = c("USC00186350", "GME00127786", "JA000047759", "CA001108395"), var = c("tmin"), 
+                         date_min = "1950-01-01", date_max = "2024-05-31")[[1]],
+            by = c("date", "id")) %>%
+  dplyr::select(id = id, date, tmin, tmax) %>%
+  mutate(year = as.integer(format(date, "%Y")),
+         doy = yday(date),
+         temp = (tmin + tmax) / 20,
+         temp = ifelse(is.na(temp), tmax / 10, temp),
+         temp = ifelse(is.na(temp), tmin/10 , temp))%>%
+  filter(doy < 92) %>%
+  group_by(id, year) %>%
+  arrange(date) %>%
+  mutate(temp0 = ifelse(temp < 0, 0, temp),
+         temp0 = ifelse(is.na(temp0), 0, temp0),
+         cum_temp = cumsum(temp0)) %>%
+  dplyr::select(id = id, year, doy, cum_temp) %>%
+  pivot_wider(names_from = doy, values_from = cum_temp)
+
+conversion <-
+  tibble(id = c("USC00186350", "JA000047759", "GME00127786", "CA001108395"),
+        location = c("washingtondc",  "kyoto",  "liestal", "vancouver"))
+
+test2 <- left_join(test, 
+                   left_join(temp, conversion), 
+                   by = c("location", "year"))
+
+library(data.table)
+variable_names <- names(test2)
+setnames(test2, old = variable_names[grepl("^\\d", variable_names)],
+         new = paste0("D", variable_names[grepl("^\\d", variable_names)]))
+
+test2 <- test2 %>%
+  select(-id)
+
+#will be used for random forest and stan4bart
+test3 <- test2[test2$season == "Spring",]
+#creating a training data set
+test3_1 <- test3[test3$year < 2019 | test3$location == "vancouver",]
+#creating a test data set
+test3_2 <- test3[test3$year >= 2019 & test3$location != "vancouver",]
+```
+
+```{r}
+#linear regression model
+lmfit <- lm(bloom_doy ~ tmax_avg + location, data = test_1)
+summary(lmfit)
+#training predictions
+sqrt(mean((predict(lmfit) - test$bloom_doy)^2)) #8.99  
+#test predictions
+sqrt(mean((predict(lmfit, newdata = test_2) - test$bloom_doy)^2)) #9.45
+```
+
+```{r}
+#linear mixed effect model
+library('lme4') 
+fit_re <- lmer(bloom_doy ~ tmin_avg + tmax_avg +
+                 (1 | location) + (tmin_avg | location) +  (tmin_avg | location),
+               data = test_1)
+
+#training predictions
+sqrt(mean((predict(fit_re) - test$bloom_doy)^2)) #9.19  
+#test predictions
+sqrt(mean((predict(fit_re, newdata = test_2) - test$bloom_doy)^2)) #10.68
+
+```
+
+```{r}
+#random forest model
+library(randomForest)
+set.seed(123)
+cherry_bag_new <- randomForest(bloom_doy ~ . , data = test3_1, mtyr = ncol(test3_1)-1, 
+                               importance = TRUE, na.action = na.omit)
+importance(cherry_bag_new)
+varImpPlot(cherry_bag_new)
+#training predictions
+rfpre_in <- predict(cherry_bag_new, newdata = test3_1, na.action = na.omit)
+sqrt(mean((test3_1$bloom_doy - rfpre_in)^2, na.rm = TRUE))
+#test predictions
+rfpre_out <- predict(cherry_bag_new, newdata = test3_2, na.action = na.omit)
+sqrt(mean((test3_2$bloom_doy - rfpre_out)^2, na.rm = TRUE))
+```
+
+```{r}
+#stan4bart model (it will take a while to compute)
+library("stan4bart") 
+fit2 <- stan4bart(bloom_doy ~ bart(. - location - tmin_avg - tmax_avg) + 
+                   (1 + tmin_avg + tmax_avg | location),
+                 data = na.omit(test3_1), 
+                 bart_args = list(keepTrees = TRUE))
+#training predictions
+bloom_doy_pred2_1 <- rowMeans(predict(fit2))
+sqrt(mean((bloom_doy_pred2_1 - na.omit(test3_1)$bloom_doy)^2)) #2.07
+
+#test predictions
+bloom_doy_pred2_2 <- rowMeans(predict(fit2, newdata = test3_2))
+sqrt(mean((bloom_doy_pred2_2 - test3_2$bloom_doy)^2)) 
+```
+
+```{r}
+#code to produce graph in the write up
+qplot(bloom_doy_pred2_1, na.omit(test3_1)$bloom_doy) + 
+  labs(title = "Actual Bloom Dates vs Stan4Bart Predicted Bloom Dates", x = "Predicted Bloom Dates (Day of the Year)", y = "Actual Bloom Dates (Day of the Year)") +
+  geom_abline(intercept = 0, slope = 1, linetype = 2) +
+  geom_point(aes(predicted, actual), color = "red",
+              data = 
+                tibble(actual = test3_2$bloom_doy,
+                       predicted = bloom_doy_pred2_2)) +
+  coord_flip()
+```
+```{r}
+#making predictions for 2024
+#reading in 2024 data excel file and cleaning it up
+data2024 <- read_excel("data2024.xlsx", skip = 1)
+data2024$season <- as.factor(data2024$season)
+data2024$bloom_doy <- as.numeric(data2024$bloom_doy)
+data2024$bloom_doy <- 0
+data2024DCKYLI <- data2024 %>% filter(location != "Newyork")
+
+#training official model
+model <- stan4bart(bloom_doy ~ bart(. - location - tmin_avg - tmax_avg) + 
+                    (1 + tmin_avg + tmax_avg | location),
+                  data = na.omit(test3), 
+                  bart_args = list(keepTrees = TRUE))
+
+location <- data2024DCKYLI$location
+#getting predictions
+prediction <- round(rowMeans(predict(model, newdata = data2024DCKYLI)), digits = 0)
+#getting prediction intervals
+lower <- round(apply(predict(model, newdata = data2024DCKYLI), 1, quantile, prob = .025), digits = 0)
+upper <- round(apply(predict(model, newdata = data2024DCKYLI), 1, quantile, prob = .975), digits = 0)
+
+
+```
+
+```{r}
+#doing new york predictions differently because there is no prior new york data
+newyork <- read_excel("newyorkprediction1.xlsx")
+newyorkpre <- round(mean(rowMeans(predict(model, newdata = newyork))), digits = 0)
+nylower <- round(quantile(colMeans(predict(model, newdata = newyork)), prob = .025), digits = 0)
+nyupper <- round(quantile(colMeans(predict(model, newdata = newyork)), prob = .975), digits = 0)
+
+```
+
+```{r}
+#putting them into one data frame for submission
+
+submission <- data.frame(location, prediction, lower, upper)
+submission <- rbind(submission, c("newyork", newyorkpre, nylower, nyupper))
+submission <- submission %>% arrange(factor(location, 
+                                            levels = c("washingtondc", "liestal"
+                                                       ,"kyoto", "vancouver", "newyork")))
+
+#write excel file
+write.csv(submission, file = "cherrypredictions.csv", row.names = FALSE)
+
+```
+
+
+
+
